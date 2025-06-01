@@ -5,15 +5,19 @@ from torch.distributions import Normal, kl_divergence
 from typing import Dict, List, Optional, Tuple, Union
 import math
 import numpy as np
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from reward_models.base_reward_model import BaseRewardModel, RewardOutput, RewardType
-from .transformer_reward_model import TransformerRewardModel
+from reward_models.transformer_reward_model import TransformerRewardModel
 
 class UncertaintyAwareRM(TransformerRewardModel):
     def __init__(
         self,
         *args,
         uncertainty_method: str = "mc_dropout",
+        
         num_mc_samples: int = 10,
         epistemic_uncertainty: bool = True,
         aleatoric_uncertainty: bool = True,

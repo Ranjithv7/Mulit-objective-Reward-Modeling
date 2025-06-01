@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Union
-import math
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import spacy
+import re
+from transformers import AutoTokenizer
+import numpy as np
+
 from reward_models.base_reward_model import BaseRewardModel, RewardOutput, RewardType
 from reward_models.transformer_reward_model import TransformerRewardModel
 
@@ -13,448 +14,274 @@ class ProcessRewardModel(TransformerRewardModel):
     def __init__(
         self,
         *args,
-        step_granularity: str = "token",
-        process_supervision_type: str = "dense",
-        outcome_weight: float = 0.5,
-        process_weight: float = 0.5,
-        step_pooling: str = "attention",
+        step_supervision_weight: float = 1.0,
+        outcome_supervision_weight: float = 0.5,
+        step_detection_method: str = "spacy",
+        reasoning_format: str = "cot",  # chain-of-thought, step-by-step, etc.
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         
-        self.step_granularity = step_granularity
-        self.process_supervision_type = process_supervision_type
-        self.outcome_weight = outcome_weight
-        self.process_weight = process_weight
-        self.step_pooling = step_pooling
+        self.step_supervision_weight = step_supervision_weight
+        self.outcome_supervision_weight = outcome_supervision_weight
+        self.step_detection_method = step_detection_method
+        self.reasoning_format = reasoning_format
         
-        self.process_head = ProcessHead(
-            self.hidden_size,
-            self.num_objectives,
-            step_pooling
+        # Initialize NLP tools for robust step detection
+        if step_detection_method == "spacy":
+            self.nlp = spacy.load("en_core_web_sm")
+        
+        # Process-level components
+        self.step_reward_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_size // 2, 1)
         )
         
-        self.outcome_head = nn.Linear(self.hidden_size, self.num_objectives)
+        self.step_confidence_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 4),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size // 4, 1),
+            nn.Sigmoid()
+        )
         
-        if process_supervision_type == "sparse":
-            self.step_selector = StepSelector(self.hidden_size)
+        self.step_verifier = StepVerifier(self.hidden_size)
+        self.reasoning_parser = ReasoningChainParser(self.nlp, reasoning_format)
         
-        self.step_confidence = StepConfidenceEstimator(self.hidden_size)
-        
+        # Outcome reward head
+        self.outcome_reward_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_size // 2, self.num_objectives)
+        )
+    
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        step_boundaries: Optional[torch.Tensor] = None,
-        step_labels: Optional[torch.Tensor] = None,
-        return_dict: bool = True
+        step_boundaries: Optional[List[List[Tuple[int, int]]]] = None,
+        return_dict: bool = True,
+        return_step_rewards: bool = True
     ) -> Union[torch.Tensor, RewardOutput]:
+        # Get hidden states from backbone
         pooled_output, backbone_outputs = self._encode_sequence(input_ids, attention_mask)
         hidden_states = backbone_outputs.last_hidden_state
         
-        if self.step_granularity == "sentence":
-            step_features, step_boundaries = self._extract_sentence_steps(hidden_states, attention_mask)
-        elif self.step_granularity == "reasoning":
-            step_features, step_boundaries = self._extract_reasoning_steps(hidden_states, attention_mask, step_boundaries)
-        else:  # token level
-            step_features = hidden_states
-            step_boundaries = torch.arange(hidden_states.size(1)).unsqueeze(0).expand(hidden_states.size(0), -1)
+        # Detect step boundaries if not provided
+        if step_boundaries is None:
+            step_boundaries = self._detect_step_boundaries(input_ids, attention_mask)
         
-        step_rewards = self.process_head(step_features, attention_mask)
-        outcome_reward = self.outcome_head(pooled_output)
+        # Compute step-level rewards
+        step_rewards = []
+        step_confidences = []
+        step_verifications = []
         
-        step_confidences = self.step_confidence(step_features)
+        batch_size = hidden_states.size(0)
         
-        if self.process_supervision_type == "sparse":
-            selected_steps = self.step_selector(step_features, step_confidences)
-            step_rewards = step_rewards * selected_steps.unsqueeze(-1)
+        for batch_idx in range(batch_size):
+            batch_steps = step_boundaries[batch_idx]
+            batch_hidden = hidden_states[batch_idx]
+            batch_step_rewards = []
+            batch_step_confidences = []
+            batch_step_verifications = []
+            
+            for start_pos, end_pos in batch_steps:
+                # Extract step representation
+                step_hidden = batch_hidden[start_pos:end_pos+1].mean(dim=0)
+                
+                # Compute step reward and confidence
+                step_reward = self.step_reward_head(step_hidden)
+                step_confidence = self.step_confidence_head(step_hidden)
+                step_verification = self.step_verifier(step_hidden.unsqueeze(0))
+                
+                batch_step_rewards.append(step_reward)
+                batch_step_confidences.append(step_confidence)
+                batch_step_verifications.append(step_verification)
+            
+            if batch_step_rewards:
+                step_rewards.append(torch.stack(batch_step_rewards))
+                step_confidences.append(torch.stack(batch_step_confidences))
+                step_verifications.append(torch.stack(batch_step_verifications))
+            else:
+                # Fallback for sequences without clear steps
+                step_rewards.append(torch.zeros(1, 1, device=hidden_states.device))
+                step_confidences.append(torch.zeros(1, 1, device=hidden_states.device))
+                step_verifications.append(torch.zeros(1, 1, device=hidden_states.device))
         
+        # Compute outcome reward
+        outcome_reward = self.outcome_reward_head(pooled_output)
+        
+        # Combine step and outcome rewards
+        step_reward_aggregated = torch.stack([sr.mean() for sr in step_rewards])
         combined_reward = (
-            self.outcome_weight * outcome_reward +
-            self.process_weight * self._aggregate_step_rewards(step_rewards, attention_mask)
+            self.step_supervision_weight * step_reward_aggregated.unsqueeze(-1) +
+            self.outcome_supervision_weight * outcome_reward
         )
         
         if self.normalize_rewards:
             combined_reward = self.normalize_reward(combined_reward)
-            step_rewards = self.normalize_reward(step_rewards)
         
         if not return_dict:
             return combined_reward
         
+        process_rewards_dict = {
+            "step_rewards": step_rewards,
+            "step_confidences": step_confidences,
+            "step_verifications": step_verifications,
+            "step_boundaries": step_boundaries
+        } if return_step_rewards else None
+        
         return RewardOutput(
             rewards=combined_reward,
-            process_rewards=[step_rewards],
+            process_rewards=step_rewards if return_step_rewards else None,
             hidden_states=pooled_output,
-            objective_breakdown={
-                "outcome_reward": outcome_reward,
-                "step_rewards": step_rewards,
-                "step_confidences": step_confidences,
-                "step_boundaries": step_boundaries
-            }
+            objective_breakdown=process_rewards_dict
         )
     
-    def _extract_sentence_steps(
-        self, 
-        hidden_states: torch.Tensor, 
+    def _detect_step_boundaries(
+        self,
+        input_ids: torch.Tensor,
         attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        # Simple sentence segmentation based on punctuation tokens
-        # In practice, use proper sentence segmentation
-        sentence_ends = self._find_sentence_boundaries(attention_mask)
-        
-        max_sentences = max(len(ends) for ends in sentence_ends)
-        sentence_features = torch.zeros(batch_size, max_sentences, hidden_size, device=hidden_states.device)
-        sentence_boundaries = torch.zeros(batch_size, max_sentences, dtype=torch.long, device=hidden_states.device)
-        
-        for b, ends in enumerate(sentence_ends):
-            start = 0
-            for i, end in enumerate(ends):
-                if i < max_sentences:
-                    sentence_repr = hidden_states[b, start:end+1].mean(dim=0)
-                    sentence_features[b, i] = sentence_repr
-                    sentence_boundaries[b, i] = end
-                    start = end + 1
-        
-        return sentence_features, sentence_boundaries
-    
-    def _extract_reasoning_steps(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        step_boundaries: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if step_boundaries is not None:
-            return self._extract_explicit_steps(hidden_states, step_boundaries)
-        else:
-            return self._extract_implicit_steps(hidden_states, attention_mask)
-    
-    def _extract_explicit_steps(
-        self,
-        hidden_states: torch.Tensor,
-        step_boundaries: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        max_steps = step_boundaries.size(1)
-        
-        step_features = torch.zeros(batch_size, max_steps, hidden_size, device=hidden_states.device)
-        
-        for b in range(batch_size):
-            start = 0
-            for s in range(max_steps):
-                end = step_boundaries[b, s].item()
-                if end > start and end < seq_len:
-                    step_repr = hidden_states[b, start:end+1].mean(dim=0)
-                    step_features[b, s] = step_repr
-                    start = end + 1
-        
-        return step_features, step_boundaries
-    
-    def _extract_implicit_steps(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Use attention patterns to identify reasoning steps
-        step_detector = ImplicitStepDetector(self.hidden_size)
-        step_probabilities = step_detector(hidden_states, attention_mask)
-        
-        # Extract steps based on high attention scores
-        step_threshold = 0.7
-        step_boundaries = (step_probabilities > step_threshold).nonzero(as_tuple=True)
-        
-        return hidden_states, step_boundaries[1].unsqueeze(0)
-    
-    def _find_sentence_boundaries(self, attention_mask: torch.Tensor) -> List[List[int]]:
-        # Simplified sentence boundary detection
-        # In practice, use proper NLP tools
+    ) -> List[List[Tuple[int, int]]]:
+        """Detect reasoning step boundaries using robust NLP methods"""
         batch_boundaries = []
         
-        for b in range(attention_mask.size(0)):
-            mask = attention_mask[b]
-            seq_len = mask.sum().item()
+        # Convert token IDs back to text for proper NLP processing
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
+        
+        for batch_idx in range(input_ids.size(0)):
+            seq_tokens = input_ids[batch_idx]
+            seq_mask = attention_mask[batch_idx]
             
-            # Mock sentence boundaries every ~20 tokens
-            boundaries = list(range(19, seq_len, 20))
-            if boundaries[-1] != seq_len - 1:
-                boundaries.append(seq_len - 1)
+            # Get actual sequence length
+            seq_len = seq_mask.sum().item()
+            actual_tokens = seq_tokens[:seq_len]
             
-            batch_boundaries.append(boundaries)
+            # Decode to text
+            text = tokenizer.decode(actual_tokens, skip_special_tokens=True)
+            
+            # Parse reasoning steps
+            step_spans = self.reasoning_parser.parse_steps(text)
+            
+            # Convert text spans back to token positions
+            token_boundaries = self._text_spans_to_token_positions(
+                text, step_spans, actual_tokens, tokenizer
+            )
+            
+            batch_boundaries.append(token_boundaries)
         
         return batch_boundaries
     
-    def _aggregate_step_rewards(self, step_rewards: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        if self.step_pooling == "mean":
-            return step_rewards.mean(dim=1)
-        elif self.step_pooling == "max":
-            return step_rewards.max(dim=1)[0]
-        elif self.step_pooling == "weighted_mean":
-            weights = F.softmax(step_rewards.sum(dim=-1), dim=1)
-            return torch.sum(step_rewards * weights.unsqueeze(-1), dim=1)
-        else:  # attention pooling
-            attention_weights = F.softmax(step_rewards.sum(dim=-1), dim=1)
-            return torch.sum(step_rewards * attention_weights.unsqueeze(-1), dim=1)
+    def _text_spans_to_token_positions(
+        self,
+        text: str,
+        text_spans: List[Tuple[int, int]],
+        tokens: torch.Tensor,
+        tokenizer
+    ) -> List[Tuple[int, int]]:
+        """Convert character-level spans to token-level positions"""
+        token_boundaries = []
+        
+        # Create character to token mapping
+        char_to_token = {}
+        current_char = 0
+        
+        for token_idx, token_id in enumerate(tokens):
+            token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+            
+            # Handle subword tokens
+            if token_text.startswith("##") or token_text.startswith("▁"):
+                token_text = token_text[2:] if token_text.startswith("##") else token_text[1:]
+            
+            for _ in range(len(token_text)):
+                if current_char < len(text):
+                    char_to_token[current_char] = token_idx
+                    current_char += 1
+        
+        # Convert spans
+        for char_start, char_end in text_spans:
+            token_start = char_to_token.get(char_start, 0)
+            token_end = char_to_token.get(char_end - 1, len(tokens) - 1)
+            token_boundaries.append((token_start, token_end))
+        
+        return token_boundaries
     
     def compute_process_loss(
         self,
-        step_rewards: torch.Tensor,
-        step_labels: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        masked_step_rewards = step_rewards * step_mask.unsqueeze(-1)
-        masked_step_labels = step_labels * step_mask.unsqueeze(-1)
-        
-        step_loss = F.mse_loss(masked_step_rewards, masked_step_labels, reduction='none')
-        step_loss = step_loss * step_mask.unsqueeze(-1)
-        
-        return step_loss.sum() / (step_mask.sum() + 1e-8)
-
-class ProcessHead(nn.Module):
-    def __init__(self, hidden_size: int, num_objectives: int = 1, pooling_type: str = "attention"):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_objectives = num_objectives
-        self.pooling_type = pooling_type
-        
-        self.step_encoder = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size // 2, hidden_size // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 4, num_objectives)
-        )
-        
-        if pooling_type == "attention":
-            self.attention_pool = nn.MultiheadAttention(
-                hidden_size, num_heads=8, batch_first=True
-            )
-    
-    def forward(self, step_features: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        if self.pooling_type == "attention":
-            attended_features, _ = self.attention_pool(
-                step_features, step_features, step_features,
-                key_padding_mask=~attention_mask.bool()
-            )
-            step_rewards = self.step_encoder(attended_features)
-        else:
-            step_rewards = self.step_encoder(step_features)
-        
-        return step_rewards
-
-class StepSelector(nn.Module):
-    def __init__(self, hidden_size: int, selection_threshold: float = 0.5):
-        super().__init__()
-        self.selection_threshold = selection_threshold
-        
-        self.selector = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, step_features: torch.Tensor, step_confidences: torch.Tensor) -> torch.Tensor:
-        selection_scores = self.selector(step_features).squeeze(-1)
-        
-        # Combine selection scores with confidence
-        combined_scores = selection_scores * step_confidences
-        
-        # Binary selection based on threshold
-        selected_steps = (combined_scores > self.selection_threshold).float()
-        
-        return selected_steps
-
-class StepConfidenceEstimator(nn.Module):
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        
-        self.confidence_estimator = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, step_features: torch.Tensor) -> torch.Tensor:
-        return self.confidence_estimator(step_features).squeeze(-1)
-
-class ImplicitStepDetector(nn.Module):
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        
-        self.step_detector = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1),
-            nn.Sigmoid()
-        )
-        
-        self.context_attention = nn.MultiheadAttention(
-            hidden_size, num_heads=4, batch_first=True
-        )
-    
-    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # Use self-attention to capture context
-        attended_states, attention_weights = self.context_attention(
-            hidden_states, hidden_states, hidden_states,
-            key_padding_mask=~attention_mask.bool()
-        )
-        
-        # Detect step boundaries based on attention patterns
-        step_probabilities = self.step_detector(attended_states).squeeze(-1)
-        
-        return step_probabilities
-
-class HierarchicalProcessModel(ProcessRewardModel):
-    def __init__(
-        self,
-        *args,
-        hierarchy_levels: List[str] = ["token", "phrase", "sentence", "paragraph"],
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.hierarchy_levels = hierarchy_levels
-        
-        self.level_processors = nn.ModuleDict({
-            level: ProcessHead(self.hidden_size, self.num_objectives)
-            for level in hierarchy_levels
-        })
-        
-        self.level_aggregator = nn.Sequential(
-            nn.Linear(self.hidden_size * len(hierarchy_levels), self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, self.num_objectives)
-        )
-    
-    def forward(
-        self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        return_dict: bool = True
-    ) -> Union[torch.Tensor, RewardOutput]:
-        pooled_output, backbone_outputs = self._encode_sequence(input_ids, attention_mask)
-        hidden_states = backbone_outputs.last_hidden_state
+        step_labels: List[List[float]],
+        outcome_labels: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Compute process-level supervised loss"""
+        output = self.forward(input_ids, attention_mask, return_dict=True)
         
-        level_rewards = {}
-        level_features = []
+        # Step-level losses
+        step_loss = 0.0
+        confidence_loss = 0.0
+        verification_loss = 0.0
         
-        for level in self.hierarchy_levels:
-            if level == "token":
-                level_input = hidden_states
-            elif level == "phrase":
-                level_input = self._extract_phrase_features(hidden_states, attention_mask)
-            elif level == "sentence":
-                level_input, _ = self._extract_sentence_steps(hidden_states, attention_mask)
-            elif level == "paragraph":
-                level_input = self._extract_paragraph_features(hidden_states, attention_mask)
+        num_steps = 0
+        
+        for batch_idx, (step_rewards, step_confidences, step_verifications) in enumerate(
+            zip(output.objective_breakdown["step_rewards"],
+                output.objective_breakdown["step_confidences"],
+                output.objective_breakdown["step_verifications"])
+        ):
+            batch_step_labels = step_labels[batch_idx]
             
-            level_reward = self.level_processors[level](level_input, attention_mask)
-            level_rewards[level] = level_reward
-            level_features.append(level_input.mean(dim=1))
+            if len(batch_step_labels) == len(step_rewards):
+                step_targets = torch.tensor(batch_step_labels, device=step_rewards.device)
+                
+                step_loss += F.mse_loss(step_rewards.squeeze(-1), step_targets)
+                
+                # Confidence should be high for correct steps
+                confidence_targets = (step_targets > 0.5).float()
+                confidence_loss += F.binary_cross_entropy(
+                    step_confidences.squeeze(-1), 
+                    confidence_targets
+                )
+                
+                # Verification loss (steps should be verified as valid)
+                verification_targets = torch.ones_like(step_verifications.squeeze(-1))
+                verification_loss += F.binary_cross_entropy(
+                    step_verifications.squeeze(-1),
+                    verification_targets
+                )
+                
+                num_steps += len(step_rewards)
         
-        # Aggregate across levels
-        combined_features = torch.cat(level_features, dim=-1)
-        hierarchical_reward = self.level_aggregator(combined_features)
+        # Normalize step losses
+        if num_steps > 0:
+            step_loss /= num_steps
+            confidence_loss /= num_steps
+            verification_loss /= num_steps
         
-        if not return_dict:
-            return hierarchical_reward
+        # Outcome loss
+        outcome_loss = F.mse_loss(output.rewards, outcome_labels)
         
-        return RewardOutput(
-            rewards=hierarchical_reward,
-            hidden_states=pooled_output,
-            objective_breakdown=level_rewards
-        )
-    
-    def _extract_phrase_features(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # Extract phrase-level features (every 5-10 tokens)
-        phrase_length = 7
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        num_phrases = seq_len // phrase_length
-        phrase_features = torch.zeros(batch_size, num_phrases, hidden_size, device=hidden_states.device)
-        
-        for i in range(num_phrases):
-            start = i * phrase_length
-            end = min((i + 1) * phrase_length, seq_len)
-            phrase_features[:, i] = hidden_states[:, start:end].mean(dim=1)
-        
-        return phrase_features
-    
-    def _extract_paragraph_features(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # Extract paragraph-level features (every 50-100 tokens)
-        paragraph_length = 75
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        num_paragraphs = max(1, seq_len // paragraph_length)
-        paragraph_features = torch.zeros(batch_size, num_paragraphs, hidden_size, device=hidden_states.device)
-        
-        for i in range(num_paragraphs):
-            start = i * paragraph_length
-            end = min((i + 1) * paragraph_length, seq_len)
-            paragraph_features[:, i] = hidden_states[:, start:end].mean(dim=1)
-        
-        return paragraph_features
-
-class VerificationAugmentedPRM(ProcessRewardModel):
-    def __init__(
-        self,
-        *args,
-        verification_model: Optional[nn.Module] = None,
-        verification_weight: float = 0.3,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        
-        if verification_model is None:
-            self.verification_model = StepVerifier(self.hidden_size)
-        else:
-            self.verification_model = verification_model
-        
-        self.verification_weight = verification_weight
-    
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        return_dict: bool = True
-    ) -> Union[torch.Tensor, RewardOutput]:
-        # Get base process rewards
-        base_output = super().forward(input_ids, attention_mask, return_dict=True)
-        
-        # Verify each step
-        step_rewards = base_output.objective_breakdown["step_rewards"]
-        verification_scores = self.verification_model(step_rewards, attention_mask)
-        
-        # Combine process rewards with verification
-        verified_step_rewards = step_rewards * verification_scores.unsqueeze(-1)
-        
-        # Re-aggregate with verification
-        verified_reward = (
-            self.outcome_weight * base_output.objective_breakdown["outcome_reward"] +
-            self.process_weight * self._aggregate_step_rewards(verified_step_rewards, attention_mask)
+        # Combined loss
+        total_loss = (
+            self.step_supervision_weight * (step_loss + 0.1 * confidence_loss + 0.1 * verification_loss) +
+            self.outcome_supervision_weight * outcome_loss
         )
         
-        if not return_dict:
-            return verified_reward
-        
-        return RewardOutput(
-            rewards=verified_reward,
-            process_rewards=[verified_step_rewards],
-            hidden_states=base_output.hidden_states,
-            objective_breakdown={
-                **base_output.objective_breakdown,
-                "verification_scores": verification_scores,
-                "verified_step_rewards": verified_step_rewards
-            }
-        )
+        return {
+            "total_loss": total_loss,
+            "step_loss": step_loss,
+            "confidence_loss": confidence_loss,
+            "verification_loss": verification_loss,
+            "outcome_loss": outcome_loss
+        }
 
 class StepVerifier(nn.Module):
+    """Verifies if a reasoning step is valid and well-formed"""
     def __init__(self, hidden_size: int):
         super().__init__()
         
-        self.verifier = nn.Sequential(
+        self.verification_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
@@ -463,76 +290,257 @@ class StepVerifier(nn.Module):
             nn.Linear(hidden_size // 4, 1),
             nn.Sigmoid()
         )
+        
+        # Multi-aspect verification
+        self.coherence_head = nn.Linear(hidden_size, 1)
+        self.relevance_head = nn.Linear(hidden_size, 1)
+        self.completeness_head = nn.Linear(hidden_size, 1)
     
-    def forward(self, step_features: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        verification_scores = self.verifier(step_features).squeeze(-1)
+    def forward(self, step_hidden: torch.Tensor) -> torch.Tensor:
+        # Overall verification score
+        verification_score = self.verification_head(step_hidden)
         
-        # Mask out padded positions
-        verification_scores = verification_scores * attention_mask.float()
+        # Individual aspects
+        coherence = torch.sigmoid(self.coherence_head(step_hidden))
+        relevance = torch.sigmoid(self.relevance_head(step_hidden))
+        completeness = torch.sigmoid(self.completeness_head(step_hidden))
         
-        return verification_scores
+        # Weighted combination
+        combined_score = 0.4 * verification_score + 0.3 * coherence + 0.2 * relevance + 0.1 * completeness
+        
+        return combined_score
+
+class ReasoningChainParser:
+    """Robust reasoning chain parser using NLP tools"""
+    def __init__(self, nlp_model, reasoning_format: str = "cot"):
+        self.nlp = nlp_model
+        self.reasoning_format = reasoning_format
+        
+        # Define step indicators for different reasoning formats
+        self.step_patterns = {
+            "cot": [
+                r"Step \d+:",
+                r"\d+\.",
+                r"First,?",
+                r"Second,?",
+                r"Third,?",
+                r"Next,?",
+                r"Then,?",
+                r"Finally,?",
+                r"Therefore,?",
+                r"So,?"
+            ],
+            "step_by_step": [
+                r"Step \d+:",
+                r"\d+\)",
+                r"- ",
+                r"• "
+            ],
+            "reasoning": [
+                r"Because",
+                r"Since",
+                r"Given that",
+                r"If",
+                r"When",
+                r"Therefore",
+                r"Thus",
+                r"Hence"
+            ]
+        }
+    
+    def parse_steps(self, text: str) -> List[Tuple[int, int]]:
+        """Parse reasoning steps from text using NLP"""
+        doc = self.nlp(text)
+        
+        # Method 1: Pattern-based detection
+        pattern_spans = self._pattern_based_detection(text)
+        
+        # Method 2: Sentence-based segmentation
+        sentence_spans = self._sentence_based_detection(doc)
+        
+        # Method 3: Discourse marker detection
+        discourse_spans = self._discourse_marker_detection(doc)
+        
+        # Combine and refine spans
+        all_spans = pattern_spans + sentence_spans + discourse_spans
+        refined_spans = self._refine_spans(all_spans, len(text))
+        
+        return refined_spans
+    
+    def _pattern_based_detection(self, text: str) -> List[Tuple[int, int]]:
+        """Detect steps using regex patterns"""
+        spans = []
+        patterns = self.step_patterns.get(self.reasoning_format, self.step_patterns["cot"])
+        
+        # Find pattern matches
+        pattern_positions = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                pattern_positions.append(match.start())
+        
+        pattern_positions = sorted(set(pattern_positions))
+        
+        # Create spans between patterns
+        for i in range(len(pattern_positions)):
+            start = pattern_positions[i]
+            end = pattern_positions[i + 1] if i + 1 < len(pattern_positions) else len(text)
+            
+            # Find sentence end within this span
+            span_text = text[start:end]
+            sentences = span_text.split('. ')
+            if len(sentences) > 1:
+                end = start + len(sentences[0]) + 1
+            
+            spans.append((start, min(end, len(text))))
+        
+        return spans
+    
+    def _sentence_based_detection(self, doc) -> List[Tuple[int, int]]:
+        """Detect steps based on sentence boundaries"""
+        spans = []
+        
+        for sent in doc.sents:
+            # Check if sentence contains reasoning indicators
+            sent_text = sent.text.lower()
+            
+            reasoning_indicators = [
+                "because", "since", "therefore", "thus", "hence", "so",
+                "first", "second", "third", "next", "then", "finally",
+                "step", "let's", "we need", "we can", "this means"
+            ]
+            
+            if any(indicator in sent_text for indicator in reasoning_indicators):
+                spans.append((sent.start_char, sent.end_char))
+        
+        return spans
+    
+    def _discourse_marker_detection(self, doc) -> List[Tuple[int, int]]:
+        """Detect steps using discourse markers and dependency parsing"""
+        spans = []
+        
+        # Look for discourse connectives and logical operators
+        discourse_markers = {"because", "since", "therefore", "thus", "hence", "so", "then", "next"}
+        
+        current_span_start = 0
+        
+        for token in doc:
+            if token.text.lower() in discourse_markers and token.dep_ in ["mark", "advmod", "cc"]:
+                # End current span and start new one
+                if current_span_start < token.idx:
+                    spans.append((current_span_start, token.idx))
+                current_span_start = token.idx
+        
+        # Add final span
+        if current_span_start < len(doc.text):
+            spans.append((current_span_start, len(doc.text)))
+        
+        return spans
+    
+    def _refine_spans(self, spans: List[Tuple[int, int]], text_length: int) -> List[Tuple[int, int]]:
+        """Refine and merge overlapping spans"""
+        if not spans:
+            return [(0, text_length)]
+        
+        # Sort spans by start position
+        spans = sorted(set(spans))
+        
+        # Merge overlapping spans
+        merged = []
+        current_start, current_end = spans[0]
+        
+        for start, end in spans[1:]:
+            if start <= current_end + 10:  # Allow small gaps
+                current_end = max(current_end, end)
+            else:
+                merged.append((current_start, current_end))
+                current_start, current_end = start, end
+        
+        merged.append((current_start, current_end))
+        
+        # Filter out very short spans (< 10 characters)
+        merged = [(s, e) for s, e in merged if e - s >= 10]
+        
+        # Ensure coverage of full text
+        if not merged or merged[0][0] > 10:
+            merged.insert(0, (0, merged[0][0] if merged else text_length))
+        
+        if merged[-1][1] < text_length - 10:
+            merged.append((merged[-1][1], text_length))
+        
+        return merged
 
 class ProcessRewardTrainer:
+    """Trainer for process reward models with step-level supervision"""
     def __init__(
         self,
         model: ProcessRewardModel,
         learning_rate: float = 1e-4,
-        process_loss_weight: float = 0.5,
+        step_loss_weight: float = 1.0,
         outcome_loss_weight: float = 0.5
     ):
         self.model = model
-        self.process_loss_weight = process_loss_weight
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        self.step_loss_weight = step_loss_weight
         self.outcome_loss_weight = outcome_loss_weight
-        
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            weight_decay=1e-5
-        )
     
     def train_step(
         self,
-        batch: Dict[str, torch.Tensor]
+        batch: Dict[str, torch.Tensor],
+        step_labels: List[List[float]],
+        outcome_labels: torch.Tensor
     ) -> Dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad()
         
-        output = self.model(
+        loss_dict = self.model.compute_process_loss(
             batch["input_ids"],
             batch["attention_mask"],
-            batch.get("step_boundaries"),
-            batch.get("step_labels"),
-            return_dict=True
+            step_labels,
+            outcome_labels
         )
         
-        # Outcome loss
-        outcome_loss = F.mse_loss(
-            output.rewards,
-            batch["outcome_labels"]
-        )
-        
-        # Process loss
-        if "step_labels" in batch:
-            process_loss = self.model.compute_process_loss(
-                output.objective_breakdown["step_rewards"],
-                batch["step_labels"],
-                batch.get("step_mask", batch["attention_mask"])
-            )
-        else:
-            process_loss = torch.tensor(0.0)
-        
-        # Combined loss
-        total_loss = (
-            self.outcome_loss_weight * outcome_loss +
-            self.process_loss_weight * process_loss
-        )
-        
+        total_loss = loss_dict["total_loss"]
         total_loss.backward()
+        
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         
-        return {
-            "total_loss": total_loss.item(),
-            "outcome_loss": outcome_loss.item(),
-            "process_loss": process_loss.item() if isinstance(process_loss, torch.Tensor) else process_loss
-        }
+        # Convert to metrics
+        metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
+        
+        return metrics
+    
+    def evaluate(
+        self,
+        eval_dataloader,
+        step_labels_list: List[List[List[float]]],
+        outcome_labels_list: List[torch.Tensor]
+    ) -> Dict[str, float]:
+        self.model.eval()
+        
+        total_metrics = {}
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(eval_dataloader):
+                step_labels = step_labels_list[batch_idx]
+                outcome_labels = outcome_labels_list[batch_idx]
+                
+                loss_dict = self.model.compute_process_loss(
+                    batch["input_ids"],
+                    batch["attention_mask"],
+                    step_labels,
+                    outcome_labels
+                )
+                
+                for key, value in loss_dict.items():
+                    if key not in total_metrics:
+                        total_metrics[key] = 0.0
+                    total_metrics[key] += value.item() if torch.is_tensor(value) else value
+                
+                num_batches += 1
+        
+        # Average metrics
+        avg_metrics = {k: v / num_batches for k, v in total_metrics.items()}
+        
+        return avg_metrics

@@ -2,590 +2,688 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Union
-import math
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import numpy as np
+from scipy.special import softmax
+from scipy.optimize import minimize
+import networkx as nx
+
 from reward_models.base_reward_model import BaseRewardModel, RewardOutput
+from .process_reward_model import ProcessRewardModel
 
 class StepwiseRewardAssigner:
+    """Assigns rewards to individual reasoning steps with various attribution methods"""
+    
     def __init__(
         self,
-        assignment_strategy: str = "progressive",
-        step_weight_decay: float = 0.9,
-        minimum_step_reward: float = 0.1,
-        correctness_bonus: float = 0.2
+        attribution_method: str = "shapley",
+        temporal_discount: float = 0.95,
+        step_importance_threshold: float = 0.1,
+        use_step_dependencies: bool = True
     ):
-        self.assignment_strategy = assignment_strategy
-        self.step_weight_decay = step_weight_decay
-        self.minimum_step_reward = minimum_step_reward
-        self.correctness_bonus = correctness_bonus
+        self.attribution_method = attribution_method
+        self.temporal_discount = temporal_discount
+        self.step_importance_threshold = step_importance_threshold
+        self.use_step_dependencies = use_step_dependencies
+        
+        # Attribution methods
+        self.attribution_methods = {
+            "shapley": self._shapley_attribution,
+            "integrated_gradients": self._integrated_gradients_attribution,
+            "attention_flow": self._attention_flow_attribution,
+            "causal_intervention": self._causal_intervention_attribution,
+            "counterfactual": self._counterfactual_attribution,
+            "temporal_difference": self._temporal_difference_attribution
+        }
     
     def assign_step_rewards(
         self,
-        final_reward: torch.Tensor,
-        step_correctness: torch.Tensor,
-        step_importance: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        if self.assignment_strategy == "progressive":
-            return self._progressive_assignment(final_reward, step_correctness, step_importance, step_mask)
-        elif self.assignment_strategy == "uniform":
-            return self._uniform_assignment(final_reward, step_correctness, step_mask)
-        elif self.assignment_strategy == "importance_weighted":
-            return self._importance_weighted_assignment(final_reward, step_correctness, step_importance, step_mask)
-        elif self.assignment_strategy == "exponential_decay":
-            return self._exponential_decay_assignment(final_reward, step_correctness, step_mask)
-        elif self.assignment_strategy == "critical_path":
-            return self._critical_path_assignment(final_reward, step_correctness, step_importance, step_mask)
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        step_boundaries: List[List[Tuple[int, int]]],
+        final_reward: torch.Tensor
+    ) -> List[List[float]]:
+        """Assign rewards to individual steps"""
+        
+        attribution_fn = self.attribution_methods.get(
+            self.attribution_method, 
+            self._shapley_attribution
+        )
+        
+        return attribution_fn(model, input_ids, attention_mask, step_boundaries, final_reward)
+    
+    def _shapley_attribution(
+        self,
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        step_boundaries: List[List[Tuple[int, int]]],
+        final_reward: torch.Tensor
+    ) -> List[List[float]]:
+        """Compute Shapley values for step contributions"""
+        batch_size = input_ids.size(0)
+        batch_step_rewards = []
+        
+        for batch_idx in range(batch_size):
+            steps = step_boundaries[batch_idx]
+            if not steps:
+                batch_step_rewards.append([])
+                continue
+            
+            step_values = self._compute_shapley_values(
+                model, 
+                input_ids[batch_idx:batch_idx+1],
+                attention_mask[batch_idx:batch_idx+1], 
+                steps,
+                final_reward[batch_idx]
+            )
+            
+            batch_step_rewards.append(step_values)
+        
+        return batch_step_rewards
+    
+    def _compute_shapley_values(
+        self,
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        steps: List[Tuple[int, int]],
+        final_reward: torch.Tensor
+    ) -> List[float]:
+        """Compute Shapley values for individual steps"""
+        n_steps = len(steps)
+        if n_steps == 0:
+            return []
+        
+        # Efficient Shapley approximation using sampling
+        n_samples = min(2**n_steps, 1000)  # Limit computational cost
+        shapley_values = [0.0] * n_steps
+        
+        # Generate all possible coalitions (or sample them)
+        if n_steps <= 10:
+            # Exact Shapley for small number of steps
+            from itertools import combinations
+            
+            for step_idx in range(n_steps):
+                marginal_contributions = []
+                
+                # Iterate over all possible coalitions not containing this step
+                for r in range(n_steps):
+                    for coalition in combinations([i for i in range(n_steps) if i != step_idx], r):
+                        # Compute value with coalition
+                        value_without = self._compute_coalition_value(
+                            model, input_ids, attention_mask, steps, list(coalition)
+                        )
+                        
+                        # Compute value with coalition + step
+                        value_with = self._compute_coalition_value(
+                            model, input_ids, attention_mask, steps, list(coalition) + [step_idx]
+                        )
+                        
+                        marginal_contrib = value_with - value_without
+                        marginal_contributions.append(marginal_contrib)
+                
+                shapley_values[step_idx] = np.mean(marginal_contributions)
         else:
-            raise ValueError(f"Unknown assignment strategy: {self.assignment_strategy}")
-    
-    def _progressive_assignment(
-        self,
-        final_reward: torch.Tensor,
-        step_correctness: torch.Tensor,
-        step_importance: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps = step_correctness.shape
-        step_rewards = torch.zeros_like(step_correctness)
+            # Monte Carlo approximation for large number of steps
+            for _ in range(n_samples):
+                # Random permutation of steps
+                permutation = np.random.permutation(n_steps)
+                
+                for i, step_idx in enumerate(permutation):
+                    # Coalition before this step in permutation
+                    coalition_before = permutation[:i].tolist()
+                    coalition_with = permutation[:i+1].tolist()
+                    
+                    value_before = self._compute_coalition_value(
+                        model, input_ids, attention_mask, steps, coalition_before
+                    )
+                    value_with = self._compute_coalition_value(
+                        model, input_ids, attention_mask, steps, coalition_with
+                    )
+                    
+                    marginal_contrib = value_with - value_before
+                    shapley_values[step_idx] += marginal_contrib / n_samples
         
-        for b in range(batch_size):
-            valid_steps = step_mask[b].sum().item()
-            if valid_steps == 0:
+        return shapley_values
+    
+    def _compute_coalition_value(
+        self,
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        steps: List[Tuple[int, int]],
+        coalition: List[int]
+    ) -> float:
+        """Compute the value of a coalition of steps"""
+        if not coalition:
+            return 0.0
+        
+        # Create masked input with only coalition steps
+        masked_input_ids = input_ids.clone()
+        masked_attention_mask = attention_mask.clone()
+        
+        # Mask out non-coalition steps (set to padding)
+        for step_idx in range(len(steps)):
+            if step_idx not in coalition:
+                start_pos, end_pos = steps[step_idx]
+                masked_input_ids[0, start_pos:end_pos+1] = 0  # Padding token
+                masked_attention_mask[0, start_pos:end_pos+1] = 0
+        
+        # Compute reward with masked input
+        with torch.no_grad():
+            output = model(masked_input_ids, masked_attention_mask, return_dict=True)
+            coalition_reward = output.rewards.item()
+        
+        return coalition_reward
+    
+    def _integrated_gradients_attribution(
+        self,
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        step_boundaries: List[List[Tuple[int, int]]],
+        final_reward: torch.Tensor
+    ) -> List[List[float]]:
+        """Compute step attributions using Integrated Gradients"""
+        batch_step_rewards = []
+        
+        for batch_idx in range(input_ids.size(0)):
+            steps = step_boundaries[batch_idx]
+            if not steps:
+                batch_step_rewards.append([])
                 continue
             
-            base_reward = final_reward[b] / valid_steps
+            step_attributions = []
             
-            for s in range(int(valid_steps)):
-                # Progressive weighting: later steps get higher weight
-                progress_weight = (s + 1) / valid_steps
-                correctness_factor = step_correctness[b, s]
-                importance_factor = step_importance[b, s]
-                
-                step_reward = base_reward * progress_weight * correctness_factor * importance_factor
-                step_reward = max(step_reward, self.minimum_step_reward)
-                
-                if correctness_factor > 0.8:  # High correctness bonus
-                    step_reward += self.correctness_bonus
-                
-                step_rewards[b, s] = step_reward
-        
-        return step_rewards
-    
-    def _uniform_assignment(
-        self,
-        final_reward: torch.Tensor,
-        step_correctness: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps = step_correctness.shape
-        step_rewards = torch.zeros_like(step_correctness)
-        
-        for b in range(batch_size):
-            valid_steps = step_mask[b].sum().item()
-            if valid_steps > 0:
-                uniform_reward = final_reward[b] / valid_steps
-                step_rewards[b, :int(valid_steps)] = uniform_reward * step_correctness[b, :int(valid_steps)]
-        
-        return step_rewards
-    
-    def _importance_weighted_assignment(
-        self,
-        final_reward: torch.Tensor,
-        step_correctness: torch.Tensor,
-        step_importance: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps = step_correctness.shape
-        step_rewards = torch.zeros_like(step_correctness)
-        
-        for b in range(batch_size):
-            valid_mask = step_mask[b].bool()
-            if valid_mask.sum() == 0:
-                continue
+            # Get embeddings for gradient computation
+            model.train()  # Enable gradients
             
-            valid_importance = step_importance[b][valid_mask]
-            valid_correctness = step_correctness[b][valid_mask]
+            # Baseline: zero embeddings
+            baseline_input = torch.zeros_like(input_ids[batch_idx:batch_idx+1])
             
-            # Normalize importance weights
-            importance_weights = valid_importance / (valid_importance.sum() + 1e-8)
+            # Target: actual input
+            target_input = input_ids[batch_idx:batch_idx+1]
             
-            # Assign rewards based on importance and correctness
-            step_reward_values = final_reward[b] * importance_weights * valid_correctness
-            step_rewards[b][valid_mask] = step_reward_values
-        
-        return step_rewards
-    
-    def _exponential_decay_assignment(
-        self,
-        final_reward: torch.Tensor,
-        step_correctness: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps = step_correctness.shape
-        step_rewards = torch.zeros_like(step_correctness)
-        
-        for b in range(batch_size):
-            valid_steps = step_mask[b].sum().item()
-            if valid_steps == 0:
-                continue
-            
-            # Exponential decay weights (recent steps get higher rewards)
-            decay_weights = torch.tensor([
-                self.step_weight_decay ** (valid_steps - s - 1)
-                for s in range(int(valid_steps))
-            ], device=step_correctness.device)
-            
-            # Normalize weights
-            decay_weights = decay_weights / decay_weights.sum()
-            
-            # Assign rewards
-            for s in range(int(valid_steps)):
-                step_rewards[b, s] = (
-                    final_reward[b] * decay_weights[s] * step_correctness[b, s]
+            # Compute integrated gradients for each step
+            for step_idx, (start_pos, end_pos) in enumerate(steps):
+                attribution = self._compute_integrated_gradient_for_step(
+                    model, baseline_input, target_input, 
+                    attention_mask[batch_idx:batch_idx+1],
+                    start_pos, end_pos
                 )
+                step_attributions.append(attribution)
+            
+            model.eval()
+            batch_step_rewards.append(step_attributions)
         
-        return step_rewards
+        return batch_step_rewards
     
-    def _critical_path_assignment(
+    def _compute_integrated_gradient_for_step(
         self,
-        final_reward: torch.Tensor,
-        step_correctness: torch.Tensor,
-        step_importance: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps = step_correctness.shape
-        step_rewards = torch.zeros_like(step_correctness)
+        model: ProcessRewardModel,
+        baseline: torch.Tensor,
+        target: torch.Tensor,
+        attention_mask: torch.Tensor,
+        start_pos: int,
+        end_pos: int,
+        n_steps: int = 50
+    ) -> float:
+        """Compute integrated gradient for a specific step span"""
         
-        for b in range(batch_size):
-            valid_mask = step_mask[b].bool()
-            if valid_mask.sum() == 0:
+        # Create interpolated inputs
+        alphas = torch.linspace(0, 1, n_steps)
+        integrated_grad = 0.0
+        
+        for alpha in alphas:
+            # Interpolate only the step region
+            interpolated = baseline.clone().float()
+            step_interpolation = baseline[:, start_pos:end_pos+1] + alpha * (
+                target[:, start_pos:end_pos+1] - baseline[:, start_pos:end_pos+1]
+            )
+            interpolated[:, start_pos:end_pos+1] = step_interpolation
+            interpolated = interpolated.long()
+            
+            # Enable gradients
+            interpolated.requires_grad_(True)
+            
+            # Forward pass
+            output = model(interpolated, attention_mask, return_dict=True)
+            reward = output.rewards.sum()
+            
+            # Backward pass
+            reward.backward()
+            
+            # Get gradients for this step
+            if interpolated.grad is not None:
+                step_grad = interpolated.grad[:, start_pos:end_pos+1].sum().item()
+                integrated_grad += step_grad
+        
+        # Average and multiply by step difference
+        step_diff = (target[:, start_pos:end_pos+1] - baseline[:, start_pos:end_pos+1]).sum().item()
+        attribution = (integrated_grad / n_steps) * step_diff
+        
+        return attribution
+    
+    def _attention_flow_attribution(
+        self,
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        step_boundaries: List[List[Tuple[int, int]]],
+        final_reward: torch.Tensor
+    ) -> List[List[float]]:
+        """Compute step attributions using attention flow analysis"""
+        batch_step_rewards = []
+        
+        # Get attention weights from model
+        with torch.no_grad():
+            outputs = model.backbone(
+                input_ids, attention_mask, 
+                output_attentions=True, return_dict=True
+            )
+            attention_weights = outputs.attentions  # List of attention matrices
+        
+        for batch_idx in range(input_ids.size(0)):
+            steps = step_boundaries[batch_idx]
+            if not steps:
+                batch_step_rewards.append([])
                 continue
             
-            # Identify critical path (steps with high importance and correctness)
-            critical_scores = step_importance[b] * step_correctness[b]
-            critical_threshold = critical_scores.quantile(0.7)
+            # Aggregate attention across layers and heads
+            aggregated_attention = self._aggregate_attention_weights(
+                attention_weights, batch_idx
+            )
             
-            critical_steps = (critical_scores >= critical_threshold) & valid_mask
-            non_critical_steps = (critical_scores < critical_threshold) & valid_mask
+            # Compute attention flow for each step
+            step_flows = []
+            for start_pos, end_pos in steps:
+                # Sum attention weights for tokens in this step
+                step_attention = aggregated_attention[start_pos:end_pos+1, :].sum()
+                step_flows.append(step_attention.item())
             
-            # Assign higher rewards to critical steps
-            critical_reward_fraction = 0.8
-            non_critical_reward_fraction = 0.2
+            # Normalize by total attention and multiply by final reward
+            total_flow = sum(step_flows) if step_flows else 1.0
+            normalized_flows = [
+                (flow / total_flow) * final_reward[batch_idx].item() 
+                for flow in step_flows
+            ]
             
-            num_critical = critical_steps.sum().item()
-            num_non_critical = non_critical_steps.sum().item()
-            
-            if num_critical > 0:
-                critical_reward = (final_reward[b] * critical_reward_fraction) / num_critical
-                step_rewards[b][critical_steps] = critical_reward
-            
-            if num_non_critical > 0:
-                non_critical_reward = (final_reward[b] * non_critical_reward_fraction) / num_non_critical
-                step_rewards[b][non_critical_steps] = non_critical_reward
+            batch_step_rewards.append(normalized_flows)
         
-        return step_rewards
+        return batch_step_rewards
+    
+    def _aggregate_attention_weights(
+        self, 
+        attention_weights: Tuple[torch.Tensor, ...], 
+        batch_idx: int
+    ) -> torch.Tensor:
+        """Aggregate attention weights across layers and heads"""
+        
+        # Take last layer attention as most relevant for final decision
+        last_layer_attention = attention_weights[-1][batch_idx]  # [heads, seq_len, seq_len]
+        
+        # Average across heads
+        aggregated = last_layer_attention.mean(dim=0)  # [seq_len, seq_len]
+        
+        return aggregated
+    
+    def _causal_intervention_attribution(
+        self,
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        step_boundaries: List[List[Tuple[int, int]]],
+        final_reward: torch.Tensor
+    ) -> List[List[float]]:
+        """Compute step attributions using causal interventions"""
+        batch_step_rewards = []
+        
+        for batch_idx in range(input_ids.size(0)):
+            steps = step_boundaries[batch_idx]
+            if not steps:
+                batch_step_rewards.append([])
+                continue
+            
+            baseline_reward = final_reward[batch_idx].item()
+            step_contributions = []
+            
+            # Intervention: remove each step and measure reward change
+            for step_idx, (start_pos, end_pos) in enumerate(steps):
+                # Create intervened input (mask out this step)
+                intervened_input = input_ids[batch_idx:batch_idx+1].clone()
+                intervened_mask = attention_mask[batch_idx:batch_idx+1].clone()
+                
+                # Replace step tokens with neutral tokens or mask
+                intervened_input[0, start_pos:end_pos+1] = model.tokenizer.pad_token_id
+                intervened_mask[0, start_pos:end_pos+1] = 0
+                
+                # Compute reward without this step
+                with torch.no_grad():
+                    output = model(intervened_input, intervened_mask, return_dict=True)
+                    intervened_reward = output.rewards.item()
+                
+                # Step contribution = baseline - intervened
+                contribution = baseline_reward - intervened_reward
+                step_contributions.append(contribution)
+            
+            batch_step_rewards.append(step_contributions)
+        
+        return batch_step_rewards
+    
+    def _counterfactual_attribution(
+        self,
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        step_boundaries: List[List[Tuple[int, int]]],
+        final_reward: torch.Tensor
+    ) -> List[List[float]]:
+        """Compute counterfactual attributions by step replacement"""
+        batch_step_rewards = []
+        
+        for batch_idx in range(input_ids.size(0)):
+            steps = step_boundaries[batch_idx]
+            if not steps:
+                batch_step_rewards.append([])
+                continue
+            
+            baseline_reward = final_reward[batch_idx].item()
+            step_contributions = []
+            
+            for step_idx, (start_pos, end_pos) in enumerate(steps):
+                # Generate counterfactual step (simplified: random replacement)
+                counterfactual_input = input_ids[batch_idx:batch_idx+1].clone()
+                
+                # Replace with random tokens from vocabulary
+                step_length = end_pos - start_pos + 1
+                random_tokens = torch.randint(
+                    1000, 5000, (1, step_length), 
+                    device=input_ids.device
+                )
+                counterfactual_input[0, start_pos:end_pos+1] = random_tokens[0]
+                
+                # Compute counterfactual reward
+                with torch.no_grad():
+                    output = model(
+                        counterfactual_input, 
+                        attention_mask[batch_idx:batch_idx+1], 
+                        return_dict=True
+                    )
+                    counterfactual_reward = output.rewards.item()
+                
+                # Contribution = original - counterfactual
+                contribution = baseline_reward - counterfactual_reward
+                step_contributions.append(contribution)
+            
+            batch_step_rewards.append(step_contributions)
+        
+        return batch_step_rewards
+    
+    def _temporal_difference_attribution(
+        self,
+        model: ProcessRewardModel,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        step_boundaries: List[List[Tuple[int, int]]],
+        final_reward: torch.Tensor
+    ) -> List[List[float]]:
+        """Compute temporal difference-based step attributions"""
+        batch_step_rewards = []
+        
+        for batch_idx in range(input_ids.size(0)):
+            steps = step_boundaries[batch_idx]
+            if not steps:
+                batch_step_rewards.append([])
+                continue
+            
+            # Compute cumulative rewards at each step
+            cumulative_rewards = []
+            
+            for i in range(len(steps) + 1):
+                if i == 0:
+                    # No steps included
+                    cumulative_rewards.append(0.0)
+                else:
+                    # Include steps 0 to i-1
+                    partial_input = input_ids[batch_idx:batch_idx+1].clone()
+                    partial_mask = attention_mask[batch_idx:batch_idx+1].clone()
+                    
+                    # Mask out steps after position i
+                    if i < len(steps):
+                        mask_start = steps[i][0]
+                        partial_input[0, mask_start:] = 0
+                        partial_mask[0, mask_start:] = 0
+                    
+                    with torch.no_grad():
+                        output = model(partial_input, partial_mask, return_dict=True)
+                        cumulative_reward = output.rewards.item()
+                    
+                    cumulative_rewards.append(cumulative_reward)
+            
+            # Compute temporal differences
+            step_contributions = []
+            for i in range(len(steps)):
+                # TD error with discount factor
+                if i < len(cumulative_rewards) - 1:
+                    td_error = (
+                        cumulative_rewards[i + 1] - 
+                        self.temporal_discount * cumulative_rewards[i]
+                    )
+                else:
+                    td_error = cumulative_rewards[i]
+                
+                step_contributions.append(td_error)
+            
+            batch_step_rewards.append(step_contributions)
+        
+        return batch_step_rewards
 
-class AdaptiveStepRewardModel(nn.Module):
+class StepRewardOptimizer:
+    """Optimizes step-level reward assignments using various criteria"""
+    
     def __init__(
         self,
-        hidden_size: int,
-        num_objectives: int = 1,
-        adaptation_strategy: str = "learned"
+        optimization_objective: str = "consistency",
+        regularization_weight: float = 0.1
     ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_objectives = num_objectives
-        self.adaptation_strategy = adaptation_strategy
-        
-        if adaptation_strategy == "learned":
-            self.step_weight_predictor = LearnedStepWeighting(hidden_size)
-        elif adaptation_strategy == "attention":
-            self.step_attention = StepAttentionWeighting(hidden_size)
-        elif adaptation_strategy == "meta":
-            self.meta_learner = MetaStepLearner(hidden_size)
-        
-        self.step_value_estimator = StepValueEstimator(hidden_size, num_objectives)
+        self.optimization_objective = optimization_objective
+        self.regularization_weight = regularization_weight
     
-    def forward(
+    def optimize_step_rewards(
         self,
-        step_features: torch.Tensor,
-        step_context: torch.Tensor,
-        final_reward: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps, _ = step_features.shape
+        step_attributions: List[List[float]],
+        final_rewards: torch.Tensor,
+        constraints: Optional[Dict[str, float]] = None
+    ) -> List[List[float]]:
+        """Optimize step rewards to satisfy various constraints"""
         
-        if self.adaptation_strategy == "learned":
-            step_weights = self.step_weight_predictor(step_features, step_context, final_reward)
-        elif self.adaptation_strategy == "attention":
-            step_weights = self.step_attention(step_features, step_context)
-        elif self.adaptation_strategy == "meta":
-            step_weights = self.meta_learner(step_features, step_context, final_reward)
-        else:
-            step_weights = torch.ones(batch_size, num_steps, device=step_features.device)
+        optimized_rewards = []
         
-        # Estimate individual step values
-        step_values = self.step_value_estimator(step_features)
-        
-        # Combine weights and values
-        step_rewards = step_weights.unsqueeze(-1) * step_values
-        
-        # Apply mask
-        step_rewards = step_rewards * step_mask.unsqueeze(-1)
-        
-        # Normalize to match final reward
-        total_predicted = step_rewards.sum(dim=1)
-        normalization_factor = final_reward.unsqueeze(-1) / (total_predicted + 1e-8)
-        step_rewards = step_rewards * normalization_factor.unsqueeze(1)
-        
-        return step_rewards
-
-class LearnedStepWeighting(nn.Module):
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        
-        self.context_encoder = nn.Sequential(
-            nn.Linear(hidden_size * 2 + 1, hidden_size),  # step + context + final_reward
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU()
-        )
-        
-        self.weight_predictor = nn.Sequential(
-            nn.Linear(hidden_size // 2, 1),
-            nn.Sigmoid()
-        )
-    
-    def forward(
-        self,
-        step_features: torch.Tensor,
-        step_context: torch.Tensor,
-        final_reward: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps, hidden_size = step_features.shape
-        
-        # Expand final reward to match step dimensions
-        final_reward_expanded = final_reward.unsqueeze(1).unsqueeze(2).expand(batch_size, num_steps, 1)
-        
-        # Combine features
-        combined_features = torch.cat([
-            step_features,
-            step_context,
-            final_reward_expanded
-        ], dim=-1)
-        
-        # Predict weights
-        encoded = self.context_encoder(combined_features)
-        weights = self.weight_predictor(encoded).squeeze(-1)
-        
-        # Normalize weights to sum to 1 across steps
-        weights = F.softmax(weights, dim=1)
-        
-        return weights
-
-class StepAttentionWeighting(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int = 8):
-        super().__init__()
-        
-        self.attention = nn.MultiheadAttention(
-            hidden_size, num_heads, batch_first=True
-        )
-        
-        self.weight_projection = nn.Linear(hidden_size, 1)
-    
-    def forward(
-        self,
-        step_features: torch.Tensor,
-        step_context: torch.Tensor
-    ) -> torch.Tensor:
-        # Use context as query, steps as key/value
-        attended_features, attention_weights = self.attention(
-            step_context, step_features, step_features
-        )
-        
-        # Project to weights
-        weights = self.weight_projection(attended_features).squeeze(-1)
-        weights = F.softmax(weights, dim=1)
-        
-        return weights
-
-class MetaStepLearner(nn.Module):
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        
-        self.meta_network = nn.Sequential(
-            nn.Linear(hidden_size + 1, hidden_size),  # context + final_reward
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU()
-        )
-        
-        self.step_weight_generator = nn.Linear(hidden_size, hidden_size)
-    
-    def forward(
-        self,
-        step_features: torch.Tensor,
-        step_context: torch.Tensor,
-        final_reward: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps, hidden_size = step_features.shape
-        
-        # Generate meta-parameters
-        context_mean = step_context.mean(dim=1)
-        meta_input = torch.cat([context_mean, final_reward.unsqueeze(-1)], dim=-1)
-        meta_params = self.meta_network(meta_input)
-        
-        # Generate step-specific weights
-        weight_params = self.step_weight_generator(meta_params)
-        
-        # Compute weights as dot product with step features
-        weights = torch.sum(
-            step_features * weight_params.unsqueeze(1),
-            dim=-1
-        )
-        
-        weights = F.softmax(weights, dim=1)
-        
-        return weights
-
-class StepValueEstimator(nn.Module):
-    def __init__(self, hidden_size: int, num_objectives: int = 1):
-        super().__init__()
-        
-        self.value_network = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size // 2, hidden_size // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 4, num_objectives)
-        )
-    
-    def forward(self, step_features: torch.Tensor) -> torch.Tensor:
-        return self.value_network(step_features)
-
-class ReasoningStepRewardModel(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        step_types: List[str] = ["premise", "inference", "conclusion"],
-        type_specific_weights: bool = True
-    ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.step_types = step_types
-        self.type_specific_weights = type_specific_weights
-        
-        self.step_type_classifier = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, len(step_types)),
-            nn.Softmax(dim=-1)
-        )
-        
-        if type_specific_weights:
-            self.type_specific_networks = nn.ModuleDict({
-                step_type: nn.Sequential(
-                    nn.Linear(hidden_size, hidden_size // 2),
-                    nn.ReLU(),
-                    nn.Linear(hidden_size // 2, 1)
-                ) for step_type in step_types
-            })
-        
-        self.reasoning_quality_estimator = ReasoningQualityEstimator(hidden_size)
-    
-    def forward(
-        self,
-        step_features: torch.Tensor,
-        reasoning_chain: torch.Tensor,
-        step_mask: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps, hidden_size = step_features.shape
-        
-        # Classify step types
-        step_type_probs = self.step_type_classifier(step_features)
-        
-        # Compute type-specific rewards
-        if self.type_specific_weights:
-            type_rewards = torch.zeros(batch_size, num_steps, 1, device=step_features.device)
+        for batch_idx, (attributions, final_reward) in enumerate(
+            zip(step_attributions, final_rewards)
+        ):
+            if not attributions:
+                optimized_rewards.append([])
+                continue
             
-            for i, step_type in enumerate(self.step_types):
-                type_mask = step_type_probs[:, :, i].unsqueeze(-1)
-                type_reward = self.type_specific_networks[step_type](step_features)
-                type_rewards += type_mask * type_reward
+            # Optimization problem: minimize objective subject to constraints
+            result = self._solve_optimization_problem(
+                attributions, final_reward.item(), constraints
+            )
+            
+            optimized_rewards.append(result)
+        
+        return optimized_rewards
+    
+    def _solve_optimization_problem(
+        self,
+        initial_rewards: List[float],
+        final_reward: float,
+        constraints: Optional[Dict[str, float]]
+    ) -> List[float]:
+        """Solve constrained optimization for step rewards"""
+        
+        n_steps = len(initial_rewards)
+        if n_steps == 0:
+            return []
+        
+        # Objective function
+        def objective(x):
+            if self.optimization_objective == "consistency":
+                # Minimize deviation from initial attributions
+                deviation = np.sum((x - np.array(initial_rewards))**2)
+                # Regularization: prefer smoother rewards
+                smoothness = np.sum(np.diff(x)**2) if len(x) > 1 else 0
+                return deviation + self.regularization_weight * smoothness
+            
+            elif self.optimization_objective == "monotonic":
+                # Encourage monotonic increase
+                violations = np.sum(np.maximum(0, x[:-1] - x[1:]))
+                deviation = np.sum((x - np.array(initial_rewards))**2)
+                return deviation + self.regularization_weight * violations
+            
+            else:
+                return np.sum((x - np.array(initial_rewards))**2)
+        
+        # Constraints
+        constraint_list = []
+        
+        # Sum constraint: step rewards should sum to final reward
+        constraint_list.append({
+            'type': 'eq',
+            'fun': lambda x: np.sum(x) - final_reward
+        })
+        
+        # Optional additional constraints
+        if constraints:
+            if 'min_reward' in constraints:
+                constraint_list.append({
+                    'type': 'ineq', 
+                    'fun': lambda x: x - constraints['min_reward']
+                })
+            
+            if 'max_reward' in constraints:
+                constraint_list.append({
+                    'type': 'ineq',
+                    'fun': lambda x: constraints['max_reward'] - x
+                })
+        
+        # Solve optimization
+        initial_guess = np.array(initial_rewards)
+        
+        result = minimize(
+            objective,
+            initial_guess,
+            method='SLSQP',
+            constraints=constraint_list,
+            options={'maxiter': 1000}
+        )
+        
+        if result.success:
+            return result.x.tolist()
         else:
-            type_rewards = torch.ones(batch_size, num_steps, 1, device=step_features.device)
-        
-        # Estimate reasoning quality
-        quality_scores = self.reasoning_quality_estimator(step_features, reasoning_chain)
-        
-        # Combine type and quality
-        step_rewards = type_rewards.squeeze(-1) * quality_scores
-        
-        # Apply mask
-        step_rewards = step_rewards * step_mask
-        
-        return step_rewards
+            # Fallback: normalize to satisfy sum constraint
+            normalized = np.array(initial_rewards)
+            current_sum = np.sum(normalized)
+            if current_sum != 0:
+                normalized = normalized * (final_reward / current_sum)
+            return normalized.tolist()
 
-class ReasoningQualityEstimator(nn.Module):
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        
-        self.coherence_estimator = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
-            nn.Sigmoid()
-        )
-        
-        self.novelty_estimator = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1),
-            nn.Sigmoid()
-        )
-        
-        self.relevance_attention = nn.MultiheadAttention(
-            hidden_size, num_heads=4, batch_first=True
-        )
+class StepDependencyAnalyzer:
+    """Analyzes dependencies between reasoning steps"""
     
-    def forward(
-        self,
-        step_features: torch.Tensor,
-        reasoning_chain: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_steps, hidden_size = step_features.shape
-        
-        # Coherence: how well each step fits with the reasoning chain
-        chain_context = reasoning_chain.mean(dim=1, keepdim=True).expand(-1, num_steps, -1)
-        coherence_input = torch.cat([step_features, chain_context], dim=-1)
-        coherence_scores = self.coherence_estimator(coherence_input).squeeze(-1)
-        
-        # Novelty: how novel/creative each step is
-        novelty_scores = self.novelty_estimator(step_features).squeeze(-1)
-        
-        # Relevance: attention-based relevance to the overall reasoning
-        relevance_features, _ = self.relevance_attention(
-            step_features, reasoning_chain, reasoning_chain
-        )
-        relevance_scores = torch.norm(relevance_features, dim=-1)
-        relevance_scores = F.sigmoid(relevance_scores)
-        
-        # Combine quality metrics
-        quality_scores = (coherence_scores + novelty_scores + relevance_scores) / 3
-        
-        return quality_scores
-
-class DynamicStepRewardAdjuster:
-    def __init__(
-        self,
-        adjustment_strategies: List[str] = ["difficulty", "progress", "error_correction"],
-        base_adjustment_rate: float = 0.1
-    ):
-        self.adjustment_strategies = adjustment_strategies
-        self.base_adjustment_rate = base_adjustment_rate
+    def __init__(self):
+        self.dependency_types = [
+            "causal", "temporal", "logical", "evidential"
+        ]
     
-    def adjust_step_rewards(
+    def build_dependency_graph(
         self,
-        step_rewards: torch.Tensor,
-        step_metadata: Dict[str, torch.Tensor],
-        adjustment_context: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        adjusted_rewards = step_rewards.clone()
+        step_texts: List[str],
+        step_embeddings: torch.Tensor
+    ) -> nx.DiGraph:
+        """Build a directed graph of step dependencies"""
         
-        for strategy in self.adjustment_strategies:
-            if strategy == "difficulty":
-                adjusted_rewards = self._difficulty_adjustment(
-                    adjusted_rewards,
-                    step_metadata.get("difficulty_scores"),
-                    adjustment_context
-                )
-            elif strategy == "progress":
-                adjusted_rewards = self._progress_adjustment(
-                    adjusted_rewards,
-                    step_metadata.get("progress_indicators"),
-                    adjustment_context
-                )
-            elif strategy == "error_correction":
-                adjusted_rewards = self._error_correction_adjustment(
-                    adjusted_rewards,
-                    step_metadata.get("error_indicators"),
-                    adjustment_context
-                )
+        n_steps = len(step_texts)
+        G = nx.DiGraph()
         
-        return adjusted_rewards
+        # Add nodes
+        for i, text in enumerate(step_texts):
+            G.add_node(i, text=text, embedding=step_embeddings[i])
+        
+        # Add edges based on dependencies
+        for i in range(n_steps):
+            for j in range(i + 1, n_steps):
+                dependency_strength = self._compute_dependency_strength(
+                    step_texts[i], step_texts[j],
+                    step_embeddings[i], step_embeddings[j]
+                )
+                
+                if dependency_strength > 0.3:  # Threshold for significant dependency
+                    G.add_edge(i, j, weight=dependency_strength)
+        
+        return G
     
-    def _difficulty_adjustment(
+    def _compute_dependency_strength(
         self,
-        step_rewards: torch.Tensor,
-        difficulty_scores: Optional[torch.Tensor],
-        context: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        if difficulty_scores is None:
+        text1: str,
+        text2: str,
+        emb1: torch.Tensor,
+        emb2: torch.Tensor
+    ) -> float:
+        """Compute dependency strength between two steps"""
+        
+        # Semantic similarity
+        semantic_sim = F.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).item()
+        
+        # Textual indicators
+        dependency_indicators = [
+            "therefore", "because", "since", "thus", "hence",
+            "given that", "it follows", "consequently"
+        ]
+        
+        text2_lower = text2.lower()
+        textual_score = sum(1 for indicator in dependency_indicators if indicator in text2_lower)
+        textual_score = min(textual_score / len(dependency_indicators), 1.0)
+        
+        # Combined score
+        dependency_strength = 0.7 * semantic_sim + 0.3 * textual_score
+        
+        return max(0, dependency_strength)
+    
+    def propagate_rewards_through_dependencies(
+        self,
+        step_rewards: List[float],
+        dependency_graph: nx.DiGraph,
+        propagation_rate: float = 0.1
+    ) -> List[float]:
+        """Propagate rewards through step dependencies"""
+        
+        if not step_rewards or dependency_graph.number_of_nodes() == 0:
             return step_rewards
         
-        # Higher rewards for more difficult steps
-        difficulty_bonus = difficulty_scores * self.base_adjustment_rate
-        return step_rewards + difficulty_bonus
-    
-    def _progress_adjustment(
-        self,
-        step_rewards: torch.Tensor,
-        progress_indicators: Optional[torch.Tensor],
-        context: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        if progress_indicators is None:
-            return step_rewards
+        propagated_rewards = step_rewards.copy()
         
-        # Bonus for steps that make significant progress
-        progress_bonus = progress_indicators * self.base_adjustment_rate * 2
-        return step_rewards + progress_bonus
-    
-    def _error_correction_adjustment(
-        self,
-        step_rewards: torch.Tensor,
-        error_indicators: Optional[torch.Tensor],
-        context: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        if error_indicators is None:
-            return step_rewards
+        # Iterative propagation
+        for _ in range(5):  # Fixed number of iterations
+            new_rewards = propagated_rewards.copy()
+            
+            for node in dependency_graph.nodes():
+                # Collect rewards from dependencies
+                incoming_reward = 0.0
+                total_weight = 0.0
+                
+                for pred in dependency_graph.predecessors(node):
+                    edge_weight = dependency_graph[pred][node]['weight']
+                    incoming_reward += propagated_rewards[pred] * edge_weight
+                    total_weight += edge_weight
+                
+                # Update reward with propagated component
+                if total_weight > 0:
+                    propagated_component = propagation_rate * (incoming_reward / total_weight)
+                    new_rewards[node] += propagated_component
+            
+            propagated_rewards = new_rewards
         
-        # Penalty for steps that introduce errors
-        error_penalty = error_indicators * self.base_adjustment_rate * 1.5
-        return step_rewards - error_penalty
-
-class StepRewardValidator:
-    def __init__(self, validation_thresholds: Dict[str, float]):
-        self.validation_thresholds = validation_thresholds
-    
-    def validate_step_rewards(
-        self,
-        step_rewards: torch.Tensor,
-        step_mask: torch.Tensor,
-        final_reward: torch.Tensor
-    ) -> Dict[str, bool]:
-        validation_results = {}
-        
-        # Check reward conservation
-        predicted_total = step_rewards.sum(dim=1)
-        conservation_error = torch.abs(predicted_total - final_reward) / (torch.abs(final_reward) + 1e-8)
-        validation_results["conservation"] = (conservation_error < self.validation_thresholds.get("conservation", 0.1)).all().item()
-        
-        # Check reward monotonicity (if expected)
-        if "monotonicity" in self.validation_thresholds:
-            reward_diffs = step_rewards[:, 1:] - step_rewards[:, :-1]
-            monotonic = (reward_diffs >= -self.validation_thresholds["monotonicity"]).all()
-            validation_results["monotonicity"] = monotonic.item()
-        
-        # Check reward range
-        min_reward = step_rewards[step_mask.bool()].min()
-        max_reward = step_rewards[step_mask.bool()].max()
-        validation_results["range"] = (
-            min_reward >= self.validation_thresholds.get("min_reward", -10.0) and
-            max_reward <= self.validation_thresholds.get("max_reward", 10.0)
-        )
-        
-        return validation_results
+        return propagated_rewards

@@ -5,8 +5,10 @@ from transformers import AutoModel, AutoConfig, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from typing import Dict, List, Optional, Tuple, Union
 import math
-
-from .base_reward_model import BaseRewardModel, RewardOutput, RewardType, RewardHead
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from reward_models.base_reward_model import BaseRewardModel, RewardOutput, RewardType, RewardHead
 
 class TransformerRewardModel(BaseRewardModel):
     def __init__(
